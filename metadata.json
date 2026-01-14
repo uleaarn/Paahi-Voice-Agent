@@ -1,0 +1,7 @@
+{
+  "name": "Paahi - A Voice That Understands",
+  "description": "Premium AI voice assistant providing natural interaction and deep understanding for modern service industry applications.",
+  "requestFramePermissions": [
+    "microphone"
+  ]
+}

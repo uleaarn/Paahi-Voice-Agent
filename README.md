@@ -1,11 +1,17 @@
-<div align="center">
 
-<img width="1200" height="475" alt="GHBanner" src="https://github.com/user-attachments/assets/0aa67016-6eaf-458a-adb2-6e31a0763ed6" />
+# Paahi/Jalwa AI Platform
 
-  <h1>Built with AI Studio</h2>
+## Backend Setup (Python)
+1. Navigate to `/backend`
+2. Install dependencies: `pip install fastapi uvicorn sqlalchemy passlib[bcrypt] python-jose[cryptography] psycopg2-binary`
+3. Configure DB: Update `database.py` with your PostgreSQL URL.
+4. Run: `uvicorn main:app --reload`
 
-  <p>The fastest path from prompt to production with Gemini.</p>
+## Frontend Setup
+1. Standard React installation: `npm install`
+2. Run: `npm run dev`
 
-  <a href="https://aistudio.google.com/apps">Start building</a>
-
-</div>
+## Security Notes
+- Password Hashing: Bcrypt is used via `passlib`.
+- JWT Tokens: Rotated and stored in secure contexts.
+- RBAC: Scoped per `restaurant_id` on all sensitive routes.
