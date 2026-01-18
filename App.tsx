@@ -57,8 +57,8 @@ const MetricsGrid: React.FC<{ stats: { count: number; revenue: string; rate: str
       <p className="text-[10px] font-black text-[#6B7280] uppercase tracking-widest mb-1">Total Orders</p>
       <p className="text-2xl font-black text-white">{stats.count}</p>
     </div>
-    <div className="bg-[#151A21] p-6 rounded-3xl border border-white/5 shadow-xl">
-      <p className="text-[10px] font-black text-[#6B7280] uppercase tracking-widest mb-1">Revenue</p>
+    <div className="bg-[#151A21] p-6 rounded-3xl border border-white/5 shadow-xl" title="Only orders in DONE state are counted.">
+      <p className="text-[10px] font-black text-[#6B7280] uppercase tracking-widest mb-1">Confirmed Revenue</p>
       <p className="text-2xl font-black text-[#00B3A4]">${stats.revenue}</p>
     </div>
     <div className="bg-[#151A21] p-6 rounded-3xl border border-white/5 shadow-xl">
@@ -73,7 +73,6 @@ const App: React.FC = () => {
   const [loginError, setLoginError] = useState('');
   const [view, setView] = useState<'login' | 'dashboard'>('login');
   
-  // Initialize from localStorage if available
   const [activities, setActivities] = useState<PastActivity[]>(() => {
     try {
       const saved = localStorage.getItem('paahi_activities');
@@ -96,21 +95,24 @@ const App: React.FC = () => {
   const [uiOutput, setUiOutput] = useState('');
   const [permissionError, setPermissionError] = useState<string | null>(null);
 
-  // Lifecycle state management
   const [lifecycle, setLifecycle] = useState<OrderLifecycle>(OrderLifecycle.IDLE);
+  const [lifecycleUpdateAt, setLifecycleUpdateAt] = useState<number>(Date.now());
+  const [systemEvents, setSystemEvents] = useState<string[]>([]);
+  const [isEventsOpen, setIsEventsOpen] = useState(false);
+  
   const lifecycleRef = useRef<OrderLifecycle>(OrderLifecycle.IDLE);
 
   useEffect(() => {
     lifecycleRef.current = lifecycle;
+    setLifecycleUpdateAt(Date.now());
   }, [lifecycle]);
 
-  // Persist activities to localStorage on change
   useEffect(() => {
     localStorage.setItem('paahi_activities', JSON.stringify(activities));
   }, [activities]);
 
   const stats = useMemo(() => {
-    const completed = activities.filter(a => a.status === 'completed' || a.lifecycle === OrderLifecycle.DONE);
+    const completed = activities.filter(a => a.lifecycle === OrderLifecycle.DONE);
     const failed = activities.filter(a => a.lifecycle === OrderLifecycle.FAILED);
     const totalRevenue = completed.reduce((acc, curr) => {
       if (curr.intent !== 'reservation' && 'items' in curr) {
@@ -130,7 +132,6 @@ const App: React.FC = () => {
   const audioContextsRef = useRef<{ input: AudioContext; output: AudioContext } | null>(null);
   const fillerManagerRef = useRef<FillerManager | null>(null);
   const jitterBufferRef = useRef<JitterBuffer>(new JitterBuffer());
-  const latencyTrackerRef = useRef(new LatencyTracker());
   const nextStartTimeRef = useRef(0);
   const sourcesRef = useRef<Set<AudioBufferSourceNode>>(new Set());
   const sessionRef = useRef<any>(null);
@@ -141,72 +142,122 @@ const App: React.FC = () => {
   const currentOutputRef = useRef('');
   const noiseFrameCounterRef = useRef(0);
 
-  const updateLifecycle = (state: OrderLifecycle) => {
+  const logSystemEvent = useCallback((event: string) => {
+    setSystemEvents(prev => [`[${new Date().toLocaleTimeString()}] ${event}`, ...prev].slice(0, 50));
+  }, []);
+
+  const updateLifecycle = useCallback((state: OrderLifecycle) => {
     console.log(`[LIFECYCLE_CHANGE] ${lifecycleRef.current} -> ${state}`);
     setLifecycle(state);
-  };
+    
+    if (state === OrderLifecycle.DONE || state === OrderLifecycle.FAILED) {
+      setTimeout(() => cleanup(), 5000);
+    }
+  }, []);
 
-  const handleOrderCompletion = useCallback(async (data: OrderData | ReservationData) => {
-    if (lifecycleRef.current === OrderLifecycle.FULFILLING || lifecycleRef.current === OrderLifecycle.DONE) return;
+  const cleanup = useCallback(() => {
+    setIsActive(false);
+    setIsConnecting(false);
+    setAiStatus('idle');
+    setLifecycle(OrderLifecycle.IDLE);
+    lifecycleRef.current = OrderLifecycle.IDLE;
+    if (fillerTimeoutRef.current) window.clearTimeout(fillerTimeoutRef.current);
+    if (silenceWatchdogRef.current) window.clearTimeout(silenceWatchdogRef.current);
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach(t => t.stop());
+      streamRef.current = null;
+    }
+    if (sourcesRef.current.size > 0 || fillerManagerRef.current?.isPlaying) {
+      sourcesRef.current.forEach(s => { try { s.stop(); } catch {} });
+      sourcesRef.current.clear();
+      fillerManagerRef.current?.stopWithFade(0); 
+      nextStartTimeRef.current = 0;
+    }
+    if (sessionRef.current) {
+      sessionRef.current.then((session: any) => { try { session.close(); } catch {} });
+      sessionRef.current = null;
+    }
+    currentInputRef.current = '';
+    currentOutputRef.current = '';
+    setUiInput('');
+    setUiOutput('');
+  }, []);
+
+  const forceEndCall = useCallback(() => {
+    logSystemEvent('[FORCE_KILL]');
+    updateLifecycle(OrderLifecycle.FAILED);
+    cleanup();
+  }, [cleanup, updateLifecycle, logSystemEvent]);
+
+  const triggerHandover = useCallback((message: string) => {
+    setTranscriptionEntries(prev => [...prev, {
+      type: 'model',
+      text: message,
+      timestamp: Date.now()
+    }]);
+    setTimeout(() => cleanup(), 4000);
+  }, [cleanup]);
+
+  const handleOrderCompletion = useCallback(async (activityId: string, data: OrderData | ReservationData) => {
+    if (lifecycleRef.current === OrderLifecycle.DONE) return;
     
     updateLifecycle(OrderLifecycle.FULFILLING);
-    console.log(`[FULFILLMENT_START] Processing final step for intent: ${data.intent}`);
+    setActivities(prev => prev.map(a => a.id === activityId ? { ...a, lifecycle: OrderLifecycle.FULFILLING } : a));
+    logSystemEvent('FULFILLMENT_START');
+    console.log(`[FULFILLMENT_START] Submitting to POS...`);
     
     try {
       await submitToPOS(data);
+      logSystemEvent('ORDER_DONE');
       console.log(`[ORDER_DONE] Order fulfilled successfully.`);
       
-      const completedActivity: PastActivity = {
-        ...data,
-        id: `act_${Date.now()}`,
-        timestamp: Date.now(),
-        restaurant_id: currentUser?.restaurant_id || 'res_01',
-        status: 'completed',
-        lifecycle: OrderLifecycle.DONE
-      };
-
-      setActivities(prev => {
-        console.log(`[RECENT_BEFORE] Count: ${prev.length}`);
-        const next = [completedActivity, ...prev];
-        console.log(`[RECENT_AFTER] Count: ${next.length}`);
-        console.log(`[METRICS_RECALC] Updating dashboard metrics with new entry.`);
-        return next;
-      });
-      
+      setActivities(prev => prev.map(a => a.id === activityId ? { ...a, lifecycle: OrderLifecycle.DONE, status: 'completed' } : a));
       updateLifecycle(OrderLifecycle.DONE);
-    } catch (error) {
+    } catch (error: any) {
+      if (error.message === 'POS_TIMEOUT') {
+        logSystemEvent('FULFILLMENT_TIMEOUT');
+      }
+      logSystemEvent('ORDER_FAILED');
+      setActivities(prev => prev.map(a => a.id === activityId ? { ...a, lifecycle: OrderLifecycle.FAILED } : a));
       console.error(`[ORDER_FAILED] Fulfillment error:`, error);
       updateLifecycle(OrderLifecycle.FAILED);
-      
-      const failedActivity: PastActivity = {
-        ...data,
-        id: `fail_${Date.now()}`,
-        timestamp: Date.now(),
-        restaurant_id: currentUser?.restaurant_id || 'res_01',
-        status: 'collecting', 
-        lifecycle: OrderLifecycle.FAILED
-      };
-      setActivities(prev => [failedActivity, ...prev]);
-      
-      triggerHandover("I'm sorry, I'm having trouble connecting to our order system. I'll pass you to a human teammate who can help.");
+      triggerHandover("I'm sorry, I'm having trouble connecting to our system. Connecting you to a human.");
     }
-  }, [currentUser]);
+  }, [triggerHandover, updateLifecycle, logSystemEvent]);
 
   const resetSilenceTimer = useCallback(() => {
     if (silenceWatchdogRef.current) window.clearTimeout(silenceWatchdogRef.current);
     if (isActive) {
       silenceWatchdogRef.current = window.setTimeout(() => {
-        console.warn("[Watchdog] 30s Silence Detected.");
-        if (sessionRef.current) {
-          sessionRef.current.then((session: any) => {
-            session.sendRealtimeInput({
-              text: "[SYSTEM: Silence timeout. Transition to abandoned.]"
-            });
-          });
-        }
+        console.warn("[Watchdog] 30s Silence Detected. Marking as FAILED.");
+        logSystemEvent('ORDER_FAILED');
+        
+        const abandoned: PastActivity = {
+          id: `abd_${Date.now()}`,
+          timestamp: Date.now(),
+          restaurant_id: currentUser?.restaurant_id || 'res_01',
+          status: 'abandoned',
+          intent: 'order',
+          customer: { name: 'Abandoned Call', phone: '' },
+          items: [],
+          requested_time: 'N/A',
+          lifecycle: OrderLifecycle.FAILED
+        } as any;
+        
+        setActivities(prev => [abandoned, ...prev]);
+        updateLifecycle(OrderLifecycle.FAILED);
+        console.log(`[ORDER_FAILED] Abandoned due to silence.`);
+        
+        setTranscriptionEntries(prev => [...prev, {
+          type: 'model',
+          text: "No activity detected. Goodbye.",
+          timestamp: Date.now()
+        }]);
+        
+        cleanup();
       }, SILENCE_TIMEOUT_MS);
     }
-  }, [isActive]);
+  }, [isActive, currentUser, cleanup, updateLifecycle, logSystemEvent]);
 
   const interruptAudio = useCallback(() => {
     if (sourcesRef.current.size > 0 || fillerManagerRef.current?.isPlaying) {
@@ -218,59 +269,21 @@ const App: React.FC = () => {
     }
   }, []);
 
-  const cleanup = useCallback(() => {
-    setIsActive(false);
-    setIsConnecting(false);
-    setAiStatus('idle');
-    updateLifecycle(OrderLifecycle.IDLE);
-    if (fillerTimeoutRef.current) window.clearTimeout(fillerTimeoutRef.current);
-    if (silenceWatchdogRef.current) window.clearTimeout(silenceWatchdogRef.current);
-    if (streamRef.current) {
-      streamRef.current.getTracks().forEach(t => t.stop());
-      streamRef.current = null;
-    }
-    interruptAudio();
-    if (sessionRef.current) {
-      sessionRef.current.then((session: any) => { try { session.close(); } catch {} });
-      sessionRef.current = null;
-    }
-    currentInputRef.current = '';
-    currentOutputRef.current = '';
-    setUiInput('');
-    setUiOutput('');
-  }, [interruptAudio]);
-
-  const triggerHandover = useCallback((message: string) => {
-    setTranscriptionEntries(prev => [...prev, {
-      type: 'model',
-      text: message,
-      timestamp: Date.now()
-    }]);
-    setTimeout(() => cleanup(), 4000);
-  }, [cleanup]);
-
   const extractJsonBlock = useCallback((text: string) => {
-    if (lifecycleRef.current === OrderLifecycle.DONE || lifecycleRef.current === OrderLifecycle.FAILED) return;
-
     const jsonMatch = text.match(/\{[\s\S]*?\}/);
     if (jsonMatch) {
       try {
         const parsed = JSON.parse(jsonMatch[0]);
         if (parsed.status === 'finalized' || parsed.status === 'abandoned') {
-          console.log(`[FINALIZE_START] Extracted ${parsed.status} state from text.`);
           setFinalData(parsed);
-          if (parsed.status === 'finalized' && lifecycleRef.current !== OrderLifecycle.FULFILLING) {
-            handleOrderCompletion(parsed);
-          }
         }
-      } catch (e) {
-        console.warn("[JSON_PARSE_ERROR] Failed to extract block");
-      }
+      } catch (e) {}
     }
-  }, [handleOrderCompletion]);
+  }, []);
 
   const handleFinalizeOrder = useCallback(async (args: any, id: string, session: any) => {
-    console.log(`[TOOL_CALL_IN] finalize_order`, args);
+    logSystemEvent('FINALIZE_ORDER_RECEIVED');
+    console.log(`[FINALIZE_START] Processing tool: finalize_order`);
     updateLifecycle(OrderLifecycle.FINALIZING);
 
     let items = [];
@@ -287,8 +300,19 @@ const App: React.FC = () => {
       status: 'finalized'
     };
 
+    const activity: PastActivity = {
+      ...data,
+      id: `act_${Date.now()}`,
+      timestamp: Date.now(),
+      restaurant_id: currentUser?.restaurant_id || 'res_01',
+      lifecycle: OrderLifecycle.FINALIZING
+    };
+    setActivities(prev => [activity, ...prev]);
+
     const vResult = validateOrder(data, restaurantHours);
     if (!vResult.valid) {
+      logSystemEvent('ORDER_FAILED');
+      setActivities(prev => prev.map(a => a.id === activity.id ? { ...a, lifecycle: OrderLifecycle.FAILED } : a));
       updateLifecycle(OrderLifecycle.FAILED);
       session.sendToolResponse({
         functionResponses: {
@@ -301,11 +325,12 @@ const App: React.FC = () => {
 
     setFinalData(data);
     session.sendToolResponse({ functionResponses: { id, name: 'finalize_order', response: { result: "ok" } } });
-    await handleOrderCompletion(data);
-  }, [restaurantHours, handleOrderCompletion]);
+    await handleOrderCompletion(activity.id, data);
+  }, [restaurantHours, handleOrderCompletion, updateLifecycle, logSystemEvent, currentUser]);
 
   const handleFinalizeReservation = useCallback(async (args: any, id: string, session: any) => {
-    console.log(`[TOOL_CALL_IN] finalize_reservation`, args);
+    logSystemEvent('FINALIZE_ORDER_RECEIVED');
+    console.log(`[FINALIZE_START] Processing tool: finalize_reservation`);
     updateLifecycle(OrderLifecycle.FINALIZING);
 
     const data: ReservationData = {
@@ -319,28 +344,41 @@ const App: React.FC = () => {
       status: 'finalized'
     };
 
+    const activity: PastActivity = {
+      ...data,
+      id: `res_${Date.now()}`,
+      timestamp: Date.now(),
+      restaurant_id: currentUser?.restaurant_id || 'res_01',
+      lifecycle: OrderLifecycle.FINALIZING
+    };
+    setActivities(prev => [activity, ...prev]);
+
     setFinalData(data);
     session.sendToolResponse({ functionResponses: { id, name: 'finalize_reservation', response: { result: "ok" } } });
-    await handleOrderCompletion(data);
-  }, [handleOrderCompletion]);
+    await handleOrderCompletion(activity.id, data);
+  }, [handleOrderCompletion, updateLifecycle, logSystemEvent, currentUser]);
 
   const handleToolCall = useCallback(async (fc: any, session: any) => {
-    const { name, args, id } = fc;
+    const rawName = fc.name;
+    const name = rawName.toLowerCase().replace(/_/g, '');
+    const { args, id } = fc;
+    
     try {
-      if (name === 'finalize_order' || name === 'finalizeOrder') {
+      if (name === 'finalizeorder') {
         await handleFinalizeOrder(args, id, session);
-      } else if (name === 'finalize_reservation' || name === 'finalizeReservation') {
+      } else if (name === 'finalizereservation') {
         await handleFinalizeReservation(args, id, session);
       } else {
-        console.warn(`[TOOL_CALL_IN] UNKNOWN_TOOL: ${name}`);
-        session.sendToolResponse({ functionResponses: { id, name, response: { error: 'unsupported_tool' } } });
+        console.warn(`[TOOL_CALL_IN] UNKNOWN_TOOL: ${rawName}`);
+        session.sendToolResponse({ functionResponses: { id, name: rawName, response: { error: 'unsupported_tool' } } });
       }
     } catch (err) {
       console.error(`[TOOL_EXECUTION_ERROR]`, err);
+      logSystemEvent('ORDER_FAILED');
       updateLifecycle(OrderLifecycle.FAILED);
       triggerHandover("Something went wrong with our digital system.");
     }
-  }, [handleFinalizeOrder, handleFinalizeReservation, triggerHandover]);
+  }, [handleFinalizeOrder, handleFinalizeReservation, triggerHandover, updateLifecycle, logSystemEvent]);
 
   const handleToggleCall = async () => {
     if (isActive || isConnecting) { cleanup(); return; }
@@ -365,7 +403,7 @@ const App: React.FC = () => {
       const sessionPromise = ai.live.connect({
         model: 'gemini-2.5-flash-native-audio-preview-12-2025',
         config: {
-          responseModalities: [Modality.AUDIO],
+          responseModalalities: [Modality.AUDIO],
           speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: selectedVoice } } },
           systemInstruction: SYSTEM_INSTRUCTION + `\n\nWINDOW: ${restaurantHours.order_start_time}-${restaurantHours.order_end_time}`,
           inputAudioTranscription: {},
@@ -375,6 +413,7 @@ const App: React.FC = () => {
         callbacks: {
           onopen: () => {
             setIsActive(true); setIsConnecting(false); setAiStatus('listening');
+            updateLifecycle(OrderLifecycle.READY);
             resetSilenceTimer();
             const source = contexts.input.createMediaStreamSource(stream);
             const sp = contexts.input.createScriptProcessor(4096, 1, 1);
@@ -472,6 +511,11 @@ const App: React.FC = () => {
     if (user) { setCurrentUser(user); setView('dashboard'); } else setLoginError('Invalid credentials.');
   };
 
+  const stuckOrders = activities.filter(a => 
+    [OrderLifecycle.COLLECTING, OrderLifecycle.FINALIZING, OrderLifecycle.FULFILLING].includes(a.lifecycle!) &&
+    (Date.now() - a.timestamp) > 60000
+  );
+
   return view === 'login' ? (
     <div className="min-h-screen bg-[#0E1116] flex items-center justify-center p-4">
       <div className="w-full max-w-md bg-[#151A21] p-10 rounded-[2.5rem] border border-white/5 shadow-2xl">
@@ -497,6 +541,11 @@ const App: React.FC = () => {
             }`}>
               State: {lifecycle}
             </div>
+            {isActive && (
+              <button onClick={forceEndCall} className="px-3 py-1.5 bg-rose-500/10 hover:bg-rose-500/20 border border-rose-500/30 text-rose-400 rounded-full text-[9px] font-black uppercase tracking-widest transition-all">
+                Force End Call
+              </button>
+            )}
             {currentUser?.role === UserRole.OWNER && (
               <button onClick={() => setIsSettingsOpen(true)} className="p-3 bg-white/5 hover:bg-white/10 border border-white/10 rounded-full transition-all text-[#6B7280]">
                 <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" /><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" /></svg>
@@ -512,6 +561,12 @@ const App: React.FC = () => {
 
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
           <div className="lg:col-span-1 space-y-6">
+            {stuckOrders.length > 0 && (
+              <div className="bg-rose-500 text-white px-6 py-4 rounded-3xl font-black uppercase tracking-widest text-[10px] flex items-center shadow-lg animate-bounce">
+                <svg className="w-5 h-5 mr-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" /></svg>
+                ⚠ {stuckOrders.length} {stuckOrders.length === 1 ? 'ORDER' : 'ORDERS'} STUCK IN {stuckOrders[0].lifecycle}
+              </div>
+            )}
             <div className="bg-[#151A21] rounded-[2.5rem] p-10 flex flex-col items-center justify-center space-y-8 relative overflow-hidden shadow-2xl border border-white/5">
               <div className="relative">
                 <button onClick={handleToggleCall} disabled={isConnecting} className={`relative w-32 h-32 rounded-full flex items-center justify-center transition-all duration-500 shadow-2xl ${isActive ? 'bg-[#EF4444]' : 'bg-[#00B3A4] hover:scale-105 active:scale-95'}`}>
@@ -523,10 +578,38 @@ const App: React.FC = () => {
                 <p className="text-[#6B7280] text-[10px] mt-2 uppercase tracking-[0.2em] font-black">{restaurantHours.order_start_time} - {restaurantHours.order_end_time}</p>
               </div>
             </div>
-            <PastActivities activities={activities.slice(0, 5)} onViewDetails={(d) => setFinalData(d)} />
+            <PastActivities activities={activities} onViewDetails={(d) => setFinalData(d)} />
           </div>
-          <div className="lg:col-span-2 h-[600px] flex flex-col">
-            <TranscriptionLog entries={transcriptionEntries} currentInput={uiInput} currentOutput={uiOutput} />
+          <div className="lg:col-span-2 flex flex-col space-y-6">
+            <div className="h-[500px] flex flex-col">
+              <TranscriptionLog entries={transcriptionEntries} currentInput={uiInput} currentOutput={uiOutput} />
+            </div>
+            
+            <div className="glass-morphism rounded-3xl overflow-hidden border border-white/5 transition-all">
+              <button 
+                onClick={() => setIsEventsOpen(!isEventsOpen)}
+                className="w-full flex items-center justify-between px-8 py-5 text-sm font-black uppercase tracking-widest text-[#6B7280] hover:bg-white/5 transition-colors"
+              >
+                <div className="flex items-center">
+                  <svg className={`w-4 h-4 mr-3 transition-transform ${isEventsOpen ? 'rotate-90' : ''}`} fill="none" stroke="currentColor" viewBox="0 0 24 24"><path d="M9 5l7 7-7 7" strokeWidth={2.5} strokeLinecap="round" strokeLinejoin="round"/></svg>
+                  System Events
+                </div>
+                <span className="bg-white/5 px-3 py-1 rounded text-[10px]">{systemEvents.length} Logs</span>
+              </button>
+              {isEventsOpen && (
+                <div className="px-8 pb-8 max-h-[250px] overflow-y-auto custom-scrollbar space-y-2 border-t border-white/5 pt-4">
+                  {systemEvents.length === 0 ? (
+                    <p className="text-[10px] text-slate-600 italic">No events recorded...</p>
+                  ) : (
+                    systemEvents.map((log, idx) => (
+                      <div key={idx} className="font-mono text-[10px] text-slate-400 border-l border-white/10 pl-3 py-1">
+                        {log}
+                      </div>
+                    ))
+                  )}
+                </div>
+              )}
+            </div>
           </div>
         </div>
         <FinalDataCard data={finalData} onClear={() => setFinalData(null)} />
